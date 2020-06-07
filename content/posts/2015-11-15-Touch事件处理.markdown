@@ -1,0 +1,275 @@
+---
+layout: single
+title: "Android事件传递机制"
+categories:
+  - 外功招式
+  - Android
+  - Android进阶
+tags:
+  - Android事件传递机制
+
+date: 2016-07-28 16:40:12
+---
+
+## Touch事件处理  
+
+### Activity中的Touch事件处理函数  
+有touch事件来的时候,会调用Activity的dispatchTouchEvent()派发事件,然后会调用getWindow().superDispatchTouchEvent(ev)派发事件,最终会调用布局中的View.
+
+```
+public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (ev.getAction() == MotionEvent.ACTION_DOWN) {
+            onUserInteraction();
+        }
+        if (getWindow().superDispatchTouchEvent(ev)) {
+            return true;
+        }
+        return onTouchEvent(ev);
+    }
+```
+
+如果View中没有消耗事件,最后会调用Activity的onTouchEvent()处理.
+
+<!-- more -->
+
+### View的Touch事件处理
+
+#### View的Touch事件处理特性  
+
+- View中的Touch事件一个是View控件的Touch事件处理,一个是ViewGroup控件的Touch事件处理,二者处理方式有所不同
+- View的Touch事件处理是先有子View控件处理,子View控件没有消耗,然后有父View控件进行处理.
+- 对于ViewGroup控件可以通过相关的方法拦截Touch事件
+- View中的Touch事件处理会先调用dispatchTouchEvent()分发,然后调用onTouch()处理,未处理会调用onTouchEvent()处理.View控件还是ViewGroup控件处理逻辑都是一致  
+
+#### View控件的Touch事件处理.  
+View处理Touch事件时首先被调用的是dispatchTouchEvent(),此方法的主要工作是调用恰当的方法进行处理.  
+
+```
+public boolean dispatchTouchEvent(MotionEvent event) {
+	...
+            ListenerInfo li = mListenerInfo;
+            if (li != null && li.mOnTouchListener != null
+                    && (mViewFlags & ENABLED_MASK) == ENABLED
+                    && li.mOnTouchListener.onTouch(this, event)) {
+                result = true;
+            }
+
+            if (!result && onTouchEvent(event)) {
+                result = true;
+            }
+        }
+	...
+	}
+```
+
+从上面的代码很容易看出,先调用onTouch()进行处理,如果onTouch()(也就是setOnTouchListener()方法设置的listener的onTouch方法)没有消耗的话,就会调用onTouchEvent()进行处理.  
+
+**以ACTION_DOWN事件分析**  
+
+```
+public boolean onTouchEvent(MotionEvent event) {
+      ...
+        if (((viewFlags & CLICKABLE) == CLICKABLE ||
+                (viewFlags & LONG_CLICKABLE) == LONG_CLICKABLE)) {
+            switch (event.getAction()) {
+				...
+                case MotionEvent.ACTION_DOWN:
+                    mHasPerformedLongPress = false;
+                        setPressed(true, x, y);
+                        checkForLongClick(0);
+            }
+			...
+            return true;
+        }
+        return false;
+    }
+```
+把代码抽取出来,基本就是设置pressed状态,检测长按事件(从方法中分析可以看出再按下500ms之后就会触发长按)
+
+**分析ACTION_MOVE**
+
+```
+    public boolean onTouchEvent(MotionEvent event) {
+	    ...
+        if (((viewFlags & CLICKABLE) == CLICKABLE ||
+                (viewFlags & LONG_CLICKABLE) == LONG_CLICKABLE)) {
+            switch (event.getAction()) {
+            ...
+
+                case MotionEvent.ACTION_MOVE:
+                    // Be lenient about moving outside of buttons
+                    if (!pointInView(x, y, mTouchSlop)) {
+                        // Outside button
+                        removeTapCallback();
+                        if ((mPrivateFlags & PFLAG_PRESSED) != 0) {
+                            // Remove any future long press/tap checks
+                            removeLongPressCallback();
+                            setPressed(false);
+                        }
+                    }
+                    break;
+			}
+		}
+    }
+```
+
+pointInView()是否在View内,一旦移动出View范围,就会移除长按消息,并设置pressed状态为false.  
+
+**分析ACTION_UP**
+
+```  
+public boolean onTouchEvent(MotionEvent event) {
+	    ...
+        if (((viewFlags & CLICKABLE) == CLICKABLE ||
+                (viewFlags & LONG_CLICKABLE) == LONG_CLICKABLE)) {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_UP:                    
+                        if (!mHasPerformedLongPress) {
+                            removeLongPressCallback();
+                            if (!focusTaken) {
+                                if (mPerformClick == null) {
+                                    mPerformClick = new PerformClick();
+                                }
+                                if (!post(mPerformClick)) {
+                                    performClick();
+                                }
+                            }
+                        }
+					}
+				}
+		}
+```
+
+如果没有触发长按事件就会mHasPerformedLongPress为false,然后移除长按事件的message,然后post(mPerformClick),如果View树已经建立联系,就会返回false,现在执行click, 否则会把mPerformClick添加进queue,等建立联系以后再执行.  
+
+从上面可以总结出click事件的触发的touch事件  
+点击事件: ACTION_DOWN -> ACTION_UP,  ACTION_DOWN -> ACTION_MOVE...-> ACTION->UP(未移动到View之外)   小于500ms or 大于500ms,长按没有被处理  
+长按事件: ACTION_DOWN -> ... ACTION_DOWN -> ACTION_MOVE...(未移动到View之外)  大于500ms  
+
+
+
+#### ViewGroup控件的Touch事件处理
+ViewGroup继承自View,并覆写View的dispatchTouchEvent()的方法.
+我们从很多书上都说ViewGroup的touch事件处理,先派发事件处理给子View控件处理,子View事件处理后返回false就有ViewGroup处理,从源码角度分析.到底是如何实现的.    
+由于代码太多,分段阅读.     
+**分析ACTION_DOWN事件**  
+
+```
+public boolean dispatchTouchEvent(MotionEvent ev) {
+
+            // 1. Handle an initial down.
+            if (actionMasked == MotionEvent.ACTION_DOWN) {
+				...
+            }
+    }
+```
+
+触发了Touch的ACTION_DOWN时,会触发,清除原来状态.  
+
+```  
+ // 2. Check for interception.
+	final boolean intercepted;
+	if (actionMasked == MotionEvent.ACTION_DOWN
+			|| mFirstTouchTarget != null) {
+			final boolean disallowIntercept = (mGroupFlags & FLAG_DISALLOW_INTERCEPT) != 0;
+			if (!disallowIntercept) {
+				intercepted = onInterceptTouchEvent(ev);
+				ev.setAction(action);
+			} else {
+				intercepted = false;
+			}
+	} else {
+			intercepted = true;
+	}
+```
+
+检测是否要拦截touch事件, 检测是否是ACTION_DOWN,是否mFirstTouchTarget(其实这个是处理事件的)为null,二者都不满足的话,会继续拦截事件.有其中一个满足就检测FLAG_DISALLOW_INTERCEPT,此flag设置,就说明,不允许ViewGroup拦截事件,没设置最后会调用onInterceptTouchEvent()来检测拦截.  
+
+```  
+if (!canceled && !intercepted) {
+
+                if (actionMasked == MotionEvent.ACTION_DOWN
+                        || (split && actionMasked == MotionEvent.ACTION_POINTER_DOWN)
+                        || actionMasked == MotionEvent.ACTION_HOVER_MOVE) {
+
+                    final int childrenCount = mChildrenCount;
+                    if (newTouchTarget == null && childrenCount != 0) {
+                        for (int i = childrenCount - 1; i >= 0; i--) {
+                            if (!canViewReceivePointerEvents(child)
+                                    || !isTransformedTouchPointInView(x, y, child, null)) {
+                                continue;
+                            }
+                            if (dispatchTransformedTouchEvent(ev, false, child, idBitsToAssign)) { //事件派发给子View处理
+                                ...
+                                newTouchTarget = addTouchTarget(child, idBitsToAssign);  //设置mFirstTouchTarget
+                                alreadyDispatchedToNewTouchTarget = true;
+                                break;
+                            }
+                        }
+
+                    }                 
+                }
+            }
+
+            if (mFirstTouchTarget == null) {
+                handled = dispatchTransformedTouchEvent(ev, canceled, null,
+                        TouchTarget.ALL_POINTER_IDS);   //ViewGroup自行处理                      
+            } else {
+				...
+			}
+```
+
+这部分主要查找ViewGroup的子View来处理,还有并有子View来处理事件.查找是通过canViewReceivePointerEvents()(也就是通过判断可见性)和isTransformedTouchPointInView()(通过touch事件是否在View上)函数. 对于消息的处理,如果子View消耗了事件,会通过addTouchTarget()函数设置mFirstTouchTarget(后面会直接通过它来处理ACTION_UP事件), 如果没有子View处理事件, mFirstTouchTarget会为null, 那么ViewGroup自己处理.  
+
+下面分析一下dispatchTransformedTouchEvent()到底如何处理事件  
+
+```
+ private boolean dispatchTransformedTouchEvent(MotionEvent event, boolean cancel,
+            View child, int desiredPointerIdBits) {
+	if (newPointerIdBits == oldPointerIdBits) {
+	            if (child == null || child.hasIdentityMatrix()) {
+	                if (child == null) {
+	                    handled = super.dispatchTouchEvent(event);    //ViewGroup自行处理事件,
+	                } else {
+	                    handled = child.dispatchTouchEvent(event);    //子View处理事件.
+
+	                    event.offsetLocation(-offsetX, -offsetY);
+	                }
+	                return handled;
+	            }
+	}
+}
+```
+
+如果child为null,就会调用ViewGroup的dispatchTouchEvent()函数派发处理,不为null,就是子View处理事件.dispatchTransformedTouchEvent()函数上面还有一段类似的代码没有显示,处理的是cancel.  
+
+**分析ACTION_MOVE**
+
+```
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+			...
+            if (mFirstTouchTarget == null) {
+                handled = dispatchTransformedTouchEvent(ev, canceled, null,   //ViewGroup处理
+                        TouchTarget.ALL_POINTER_IDS);
+            } else {
+                TouchTarget target = mFirstTouchTarget;
+                while (target != null) {
+                    final TouchTarget next = target.next;
+                    if (alreadyDispatchedToNewTouchTarget && target == newTouchTarget) {  //ACTION_DOWN已经处理,就会走这里
+                        handled = true;
+                    } else {
+                        final boolean cancelChild = resetCancelNextUpFlag(target.child)
+                                || intercepted;
+                        if (dispatchTransformedTouchEvent(ev, cancelChild,
+                                target.child, target.pointerIdBits)) {     //子View处理
+                            handled = true;
+                        }  
+                    }
+                }
+            }
+```
+
+对于ACTION_MOVE的事件拦截的检测跟ACTION_DOWN一致,这里就没有说明
+在ACTION_DOWN时候,如果没有子View处理时,mFirstTouchTarget会为null,对于ACTION_MOVE也就有ViewGroup处理,
+在ACTION_DOWN时候,如果有子View处理时,mFirstTouchTarget不会为null,如果没有拦截,对于ACTION_MOVE也就有子View处理,
+对于ACTION_UP的分析跟ACTION_MOVE一致.  
